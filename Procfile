@@ -1,1 +1,1 @@
-web: gunicorn gemini_chess:app
+web: gunicorn ChessLLM:app
