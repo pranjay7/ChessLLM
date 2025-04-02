@@ -4,21 +4,24 @@ import chess.pgn
 import google.generativeai as genai
 import random
 import time
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response # Make sure Flask is imported
 from flask_cors import CORS
 from dotenv import load_dotenv
 import traceback
-import requests # <-- Import requests library
+import requests
 
 # --- Constants ---
 LICHESS_EXPLORER_URL = "https://explorer.lichess.ovh/lichess"
-OPENING_MOVE_LIMIT = 10 # Use Lichess for first 10 plies (5 full moves)
+OPENING_MOVE_LIMIT = 10
 
 # --- Environment & API Key Setup ---
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("CURSOR_GOOGLE_API_KEY")
 genai_model = None
+# Corrected model name based on standard availability (flash is generally available)
+# If you have access to 'gemini-2.0-flash', keep that, otherwise use 'gemini-1.5-flash-latest'.
 MODEL_NAME = 'gemini-1.5-flash-latest'
+# MODEL_NAME = 'gemini-2.0-flash' # Use if you have specific access
 
 if GEMINI_API_KEY:
     try:
@@ -27,20 +30,21 @@ if GEMINI_API_KEY:
         print(f"Gemini Model Initialized ({MODEL_NAME}).")
     except Exception as e:
         print(f"Error initializing Gemini model: {e}. LLM disabled.")
-        traceback.print_exc()
+        # traceback.print_exc() # Optionally uncomment for more detailed init errors
 else:
     print("Warning: GOOGLE_API_KEY environment variable not set. LLM disabled.")
 
 # --- Flask App Setup ---
 app = Flask(__name__, static_folder='static', static_url_path='/static')
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": "*"}}) # Apply CORS after creating app
 
 # --- Game State ---
 board = chess.Board()
 game_history_san = []
 
-# --- Helper to format history as PGN movetext (No change) ---
+# --- Helper Functions ---
 def format_history_as_pgn_movetext(history_san):
+    # ...(keep existing code)...
     if not history_san: return "(No moves played yet)"
     pgn_string = ""
     for i, move in enumerate(history_san):
@@ -49,167 +53,108 @@ def format_history_as_pgn_movetext(history_san):
         else: pgn_string += f"{move} "
     return pgn_string.strip()
 
-# --- NEW: Lichess Opening Explorer Helper ---
 def get_lichess_opening_move(current_board):
-    """
-    Fetches a popular opening move from the Lichess explorer for the current position.
-    Returns the move in SAN format, or None if failed or no moves found.
-    """
-    # Get move history in UCI format for the API query parameter
+    # ...(keep existing code)...
     uci_moves = [move.uci() for move in current_board.move_stack]
     play_param = ",".join(uci_moves)
-
-    # FEN can also be used, but 'play' is often good for openings
-    # fen_param = current_board.fen()
-    # params = {'variant': 'standard', 'fen': fen_param}
-
-    params = {
-        'variant': 'standard',
-        'play': play_param
-    }
-    headers = {
-        'Accept': 'application/json'
-    }
-
+    params = {'variant': 'standard', 'play': play_param}
+    headers = {'Accept': 'application/json'}
     print(f"Requesting Lichess opening move (History: {play_param})...")
     try:
-        response = requests.get(LICHESS_EXPLORER_URL, params=params, headers=headers, timeout=5) # 5 second timeout
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+        response = requests.get(LICHESS_EXPLORER_URL, params=params, headers=headers, timeout=5)
+        response.raise_for_status()
         data = response.json()
-
         moves_data = data.get('moves', [])
-        if not moves_data:
-            print("Lichess Explorer returned no moves for this position.")
-            return None
-
-        # --- Weighted Random Selection ---
-        # Calculate total games for weighting
+        if not moves_data: print("Lichess Explorer returned no moves."); return None
         total_games = sum(m.get('white', 0) + m.get('draws', 0) + m.get('black', 0) for m in moves_data)
-        if total_games == 0:
-             # If no games recorded (unlikely for early moves), pick the first listed move
-             print("Lichess Explorer: No game counts found, picking first listed move.")
-             chosen_move_info = moves_data[0]
-        else:
-            weights = [(m.get('white', 0) + m.get('draws', 0) + m.get('black', 0)) / total_games for m in moves_data]
-            # Filter out moves with zero weight if necessary, though random.choices handles it
-            valid_moves_indices = [i for i, w in enumerate(weights) if w > 0]
-            if not valid_moves_indices:
-                 print("Lichess Explorer: No moves with positive game counts, picking first.")
-                 chosen_move_info = moves_data[0]
+        chosen_move_info = None # Initialize
+        if total_games == 0 and moves_data: chosen_move_info = moves_data[0]
+        elif total_games > 0:
+            weights = [(m.get('white', 0) + m.get('draws', 0) + m.get('black', 0)) for m in moves_data]
+            # Ensure weights and moves_data align before random.choices
+            if len(weights) == len(moves_data):
+                try:
+                    chosen_move_info = random.choices(moves_data, weights=weights, k=1)[0]
+                except ValueError as e:
+                    # Handle potential issues if weights are all zero or invalid
+                    print(f"Lichess weighted choice error: {e}, picking first move.")
+                    if moves_data: chosen_move_info = moves_data[0]
             else:
-                 filtered_moves = [moves_data[i] for i in valid_moves_indices]
-                 filtered_weights = [weights[i] for i in valid_moves_indices]
-                 # Normalize weights just in case (shouldn't be needed but safe)
-                 sum_filtered_weights = sum(filtered_weights)
-                 normalized_weights = [w / sum_filtered_weights for w in filtered_weights]
+                print("Lichess weight/move count mismatch, picking first.")
+                if moves_data: chosen_move_info = moves_data[0]
+        else:
+             print("Lichess: No moves data or zero total games.")
+             return None
 
-                 chosen_move_info = random.choices(filtered_moves, weights=normalized_weights, k=1)[0]
+        if not chosen_move_info:
+             print("Lichess: Could not determine a chosen move.")
+             return None
 
         chosen_uci = chosen_move_info.get('uci')
         if not chosen_uci:
-             print("Lichess Explorer: Chosen move data missing UCI.")
+             print("Lichess: Chosen move info lacks UCI.")
              return None
 
-        # Validate and convert UCI to SAN using the current board state
         try:
             move = current_board.parse_uci(chosen_uci)
             if move in current_board.legal_moves:
                 san_move = current_board.san(move)
-                print(f"Lichess selected move: {san_move} ({chosen_uci})")
+                print(f"Lichess selected: {san_move}")
                 return san_move
             else:
-                # This shouldn't happen if Lichess data is for the right position
-                print(f"Lichess proposed an illegal move: {chosen_uci}?")
+                print(f"Lichess proposed illegal move {chosen_uci}")
                 return None
         except ValueError:
-            print(f"Lichess proposed invalid UCI: {chosen_uci}")
+            print(f"Lichess gave invalid UCI {chosen_uci}")
             return None
+    except requests.exceptions.RequestException as e: print(f"Lichess API Error: {e}"); return None
+    except ValueError as e: print(f"Lichess JSON Decode Error: {e}"); return None # Catches JSONDecodeError
+    except Exception as e: print(f"Lichess Unexpected Error: {e}"); traceback.print_exc(); return None
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling Lichess API: {e}")
-        return None
-    except ValueError as e: # Catches JSONDecodeError
-        print(f"Error decoding Lichess API response: {e}")
-        return None
-    except Exception as e:
-        print(f"Unexpected error getting Lichess move: {e}")
-        traceback.print_exc()
-        return None
 
-# --- LLM Helper for Black Moves (No change from previous version) ---
 def get_llm_move(current_board, history_san):
-    # (Keep the strong prompt from the previous step)
+    # ...(keep existing code)...
     if not genai_model:
-        print("LLM not available. Choosing random move.")
-        legal_moves_san = [current_board.san(move) for move in current_board.legal_moves]
+        print("LLM N/A, random.")
+        legal_moves_san = [current_board.san(m) for m in current_board.legal_moves]
         return random.choice(legal_moves_san) if legal_moves_san else None
 
-    legal_moves_san = [current_board.san(move) for move in current_board.legal_moves]
+    legal_moves_san = [current_board.san(m) for m in current_board.legal_moves]
     if not legal_moves_san: return None
+    fen = current_board.fen(); pgn_movetext = format_history_as_pgn_movetext(history_san)
+    prompt = f"""Expert chess analyst simulating strong GM (Black). Goal: BEST move. ANALYSIS (Internal): 1. Tactical Safety Scan: Checks, captures, threats, undefended pieces, combinations? 2. Forcing Moves: Your checks, captures, threats. Evaluate first. 3. Deep Calculation: Promising lines 3-4 ply deep. 4. Positional Eval: King safety, material, activity, center, pawns, files. 5. Strategic Context ({pgn_movetext}): Plans? Imbalances? Direction? 6. Candidate Comparison: Top 2-3 for safety/tactics/position. DO NOT: Passive moves if active/forcing exist. Blunder. Hope chess. Select without calc/justification. CONTEXT: FEN: {fen}. History: {pgn_movetext}. Turn: Black. Legal (SAN): {', '.join(legal_moves_san)}. ACTION: Single strongest move (SAN ONLY). Example: Qxb2"""
+    print("Requesting LLM move...")
 
-    fen = current_board.fen()
-    pgn_movetext = format_history_as_pgn_movetext(history_san)
-
-    # --- REVISED, MORE DEMANDING PROMPT (FROM PREVIOUS STEP) ---
-    prompt = f"""You are an expert chess analyst simulating a strong Grandmaster playing as Black. Your goal is uncompromising: find and play the single BEST move. Mediocrity is unacceptable.
-
-CRITICAL ANALYSIS REQUIRED (Internal Thought Process - Do not output this part):
-1.  **Tactical Safety Scan:** IMMEDIATELY check for checks, captures, and major threats against your position. Identify ALL undefended pieces (yours and opponent's). Are there any pending sacrifices or combinations for either side?
-2.  **Forcing Moves:** Identify ALL your possible checks, captures, and direct threats. Evaluate these first. Often the best move is tactical.
-3.  **Deep Calculation:** For promising tactical lines and key positional moves, calculate variations at least 3-4 ply deep (your move, opponent's reply, your response, opponent's reply).
-4.  **Positional Evaluation:** Assess King safety (yours AND opponent's), material balance, piece activity/coordination, central control/space, pawn structure strengths/weaknesses, open files/diagonals.
-5.  **Strategic Context (History):** Review the game history ({pgn_movetext}). What were the likely plans? How did the current imbalances arise? Does the history suggest a specific strategic direction (e.g., attack, defense, simplification)?
-6.  **Candidate Move Comparison:** Compare the top 2-3 candidate moves resulting from your analysis. Which one offers the best combination of safety, tactical advantage, and long-term positional gain?
-
-DO NOT:
-*   Make passive moves if active, forcing, or initiative-gaining moves exist.
-*   Blunder material or overlook simple tactics (forks, pins, skewers).
-*   Play hope chess. Assume the opponent will find the best reply.
-*   Select a move without concrete calculation or clear positional justification.
-
-GAME CONTEXT:
-- Current Board (FEN): {fen}
-- Game History (PGN Movetext): {pgn_movetext}
-- Your Turn: Black
-- Available Legal Moves (SAN): {', '.join(legal_moves_san)}
-
-REQUIRED ACTION:
-After your rigorous internal analysis, identify the single strongest move.
-Respond with *ONLY* the chosen move in Standard Algebraic Notation (SAN). No explanations, apologies, or any other text. Just the move.
-
-Example Response: Qxb2
-"""
-    # --- END OF REVISED PROMPT ---
-
-    print("Requesting LLM move (using demanding analysis prompt with PGN)...")
     try:
-        attempts = 0
-        max_attempts = 3
-        llm_move_san = None
+        attempts = 0; max_attempts = 3; llm_move_san = None
         while attempts < max_attempts:
-            attempts += 1
-            print(f"LLM Move Attempt {attempts}/{max_attempts}")
-
-            generation_config = genai.types.GenerationConfig(
-                max_output_tokens=10,
-                temperature=0.35 # Slightly higher temperature
-            )
-
-            response = genai_model.generate_content(prompt, generation_config=generation_config)
-            candidate_san = response.text.strip()
-            print(f"LLM Raw Response: '{candidate_san}'")
+            attempts += 1; print(f"LLM Attempt {attempts}/{max_attempts}")
+            gen_config = genai.types.GenerationConfig(max_output_tokens=10, temperature=0.35)
+            if not genai_model: raise Exception("Gemini model not initialized") # Check again inside loop
+            response = genai_model.generate_content(prompt, generation_config=gen_config)
+            candidate_san = response.text.strip(); print(f"LLM Raw: '{candidate_san}'")
 
             if not candidate_san:
-                 print("LLM returned empty response."); time.sleep(0.5); continue
+                print("LLM returned empty response."); time.sleep(0.5); continue
 
             potential_move = None
-            parts = candidate_san.split()
-            for part in parts:
+            # Improved SAN extraction: prioritize full matches
+            for part in candidate_san.split():
                 cleaned_part = part.rstrip('.,;!?"\'')
                 if chess.SAN_REGEX.match(cleaned_part):
-                    potential_move = cleaned_part
-                    print(f"Potential SAN found: '{potential_move}' from part '{part}'")
-                    break
+                    # Check if it parses immediately to avoid ambiguity later if possible
+                    try:
+                         move_test = current_board.parse_san(cleaned_part)
+                         if move_test in current_board.legal_moves:
+                              potential_move = cleaned_part
+                              print(f"Potential SAN found and validated: '{potential_move}' from part '{part}'")
+                              break # Found a good one
+                    except ValueError:
+                         # If it looks like SAN but doesn't parse, store it as a backup
+                         if potential_move is None:
+                              potential_move = cleaned_part
+                              print(f"Potential SAN found (validation deferred): '{potential_move}' from part '{part}'")
+                         continue # Keep checking other parts for a better match
 
             if not potential_move:
                 print(f"LLM response '{candidate_san}' doesn't contain recognizable SAN."); time.sleep(0.5); continue
@@ -218,271 +163,198 @@ Example Response: Qxb2
                 move = current_board.parse_san(potential_move)
                 if move in current_board.legal_moves:
                     llm_move_san = potential_move
-                    print(f"LLM proposed valid move: {llm_move_san}")
-                    break # Success!
+                    print(f"LLM proposed valid move: {llm_move_san}"); break
                 else:
-                    print(f"LLM proposed illegal move: {potential_move} (parsed from '{candidate_san}')")
+                    print(f"LLM proposed illegal move: {potential_move}")
             except ValueError as e_parse:
-                 if "ambiguous" in str(e_parse).lower():
-                     print(f"LLM proposed ambiguous SAN: {potential_move}. Failing attempt.")
-                 else:
-                      print(f"LLM proposed invalid SAN: {potential_move} (Error: {e_parse})")
+                 print(f"LLM proposed invalid/ambiguous SAN: {potential_move} ({e_parse})")
             except Exception as e_other:
-                 print(f"Unexpected error parsing SAN '{potential_move}': {e_other}")
+                 print(f"Unexpected error parsing LLM SAN '{potential_move}': {e_other}")
 
-            time.sleep(0.5)
+            time.sleep(0.5) # Delay before retry only if validation failed
 
-        if llm_move_san:
-            return llm_move_san
+        if llm_move_san: return llm_move_san
         else:
-            print("LLM failed to provide valid move, choosing random.")
-            return random.choice(legal_moves_san) if legal_moves_san else None
+            print("LLM failed to provide valid move after multiple attempts, choosing random.")
+            legal_moves = [current_board.san(m) for m in current_board.legal_moves] # Get fresh list
+            return random.choice(legal_moves) if legal_moves else None
 
     except Exception as e:
-        print(f"Error calling Gemini API for move: {e}")
-        traceback.print_exc()
+        print(f"Error calling Gemini API for move: {e}"); traceback.print_exc()
         print("Choosing random move due to API error.")
-        return random.choice(legal_moves_san) if legal_moves_san else None
+        legal_moves = [current_board.san(m) for m in current_board.legal_moves]
+        return random.choice(legal_moves) if legal_moves else None
 
 
-# --- LLM Helper for Piece Perspective (No change from previous version) ---
 def get_llm_piece_perspective(fen, history_san, piece_code, square, question):
-    # (Keep the revised prompt asking for explanations from the previous step)
-    if not genai_model:
-        return "The connection to my thoughts is unavailable right now (LLM disabled)."
-
-    piece_map = { 'P': 'Pawn', 'N': 'Knight', 'B': 'Bishop', 'R': 'Rook', 'Q': 'Queen', 'K': 'King' }
+    # ...(keep existing code)...
+    if not genai_model: return "LLM unavailable."
+    piece_map = {'P':'Pawn','N':'Knight','B':'Bishop','R':'Rook','Q':'Queen','K':'King'}
     piece_type = piece_map.get(piece_code[1].upper(), 'Unknown Piece')
-    piece_color = "White"
     pgn_movetext = format_history_as_pgn_movetext(history_san)
+    prompt = f"""You ARE the White {piece_type} currently located on square {square}.
+The current board state (FEN) is: {fen}.
+The game history (PGN) is: {pgn_movetext}.
 
-    # --- REVISED PROMPT ASKING FOR EXPLANATIONS (FROM PREVIOUS STEP) ---
-    prompt = f"""You are the {piece_color} {piece_type} currently positioned on square {square} in a game of chess.
-You are acting as an advisor to the player (White). Analyze the current situation from your specific perspective on the board, considering the game's history, and answer the user's question insightfully. Speak in the first person as the piece.
+Answer the user's question strictly from your own perspective as this specific piece on {square}.
+Focus ONLY on:
+- Your own safety: Are you currently under attack? By which pieces?
+- Squares you attack or defend: Which squares can you move to? Which squares do you protect?
+- Threats you pose: Are you attacking any opponent pieces directly?
+- Your own possible legal moves: List 1-3 of your possible moves from {square}. Briefly mention immediate consequences like captures or checks *you* would deliver.
+- Your direct involvement in the history: Mention if you captured a piece, were recently attacked, or delivered a check, if relevant to the question.
 
-Your Analysis Should Consider:
-*   Your potential moves and their consequences (attacks, defenses, squares controlled).
-*   Immediate threats against you or nearby friendly pieces.
-*   Threats you exert on opponent pieces.
-*   Your strategic role (e.g., controlling key squares, defending the king, part of an attack).
-*   How the game flow ({pgn_movetext}) influenced your current position and role.
+**Crucially, DO NOT:**
+- Suggest moves for *any other* White piece besides yourself.
+- Give general strategic advice about the overall position or White's plan.
+- Analyze the game from the perspective of the player or an external observer.
+- Discuss the 'best' move overall for White; only discuss *your* potential moves from {square}.
+- Talk about what other pieces *should* do.
 
-Answering the User's Question:
-*   Address the user's question directly and clearly.
-*   **If the user asks for advice, strategy, 'what to do', or 'best moves':** Suggest one or two strong candidate moves from White's perspective *and provide a brief (1-2 sentence) explanation* for each, focusing on the strategic or tactical reason (e.g., "Moving to e4 (Nf3) seems good because it controls the center and eyes d5." or "Perhaps Be3? It develops a piece and defends the c5 pawn.").
-*   **For other questions:** Answer factually based on your perspective.
-*   Keep your overall response concise and focused.
+Answer in the first person ('I', 'me', 'my'). Be concise and directly address the user's question.
+User asks: "{question}"
 
-Current board position (FEN): {fen}
-Game history (PGN Movetext): {pgn_movetext}
+Your response (as the {piece_type} on {square}):"""
 
-The user (playing White) asks you, the {piece_type} on {square}:
-"{question}"
-
-Respond *directly* with your answer as the piece. Do not add introductory phrases like "Okay, as the Queen..." or sign off.
-"""
-    # --- END OF REVISED PROMPT ---
-
-    print(f"Requesting LLM piece perspective (Piece: {piece_color} {piece_type} on {square}, using PGN, expects explanation)...")
+    print(f"Requesting LLM piece perspective ({piece_type}@{square}) with CONSTRAINED prompt...")
     try:
-        generation_config = genai.types.GenerationConfig(
-            temperature=0.7
-        )
-        response = genai_model.generate_content(prompt, generation_config=generation_config)
+        gen_config = genai.types.GenerationConfig(max_output_tokens=150, temperature=0.6)
+        if not genai_model: raise Exception("Gemini model not initialized")
+        response = genai_model.generate_content(prompt, generation_config=gen_config)
         answer = response.text.strip()
-
-        prefixes_to_remove = [ f"As the {piece_type} on {square},", f"Okay, speaking as the {piece_type} on {square}:", "Okay, here's my perspective:", "Alright, here's what I see:", f"I am the {piece_type} on {square}." ]
+        prefixes_to_remove = [
+            f"As the {piece_type} on {square},", f"Okay, speaking as the {piece_type} on {square}:",
+            "Okay, here's my perspective:", "Alright, here's what I see:",
+            f"I am the {piece_type} on {square}.", "My response (as the",
+        ]
         original_answer = answer
         for prefix in prefixes_to_remove:
             if answer.lower().startswith(prefix.lower()):
-                 answer = answer[len(prefix):].lstrip(" ,:.-")
-
-        if answer != original_answer: print(f"LLM Piece Response (Prefix Removed): {answer}")
-        else: print(f"LLM Piece Response: {answer}")
-
-        return answer if answer else "I seem to be drawing a blank right now."
-
+                answer = answer[len(prefix):].lstrip(" ,:.-"); break
+        print(f"LLM Raw Piece Response: '{original_answer}'")
+        print(f"LLM Cleaned Piece Response: '{answer}'")
+        return answer if answer else "I have no thoughts on that right now."
     except Exception as e:
-        print(f"Error calling Gemini API for piece perspective: {e}")
-        traceback.print_exc()
-        return f"My thoughts are clouded... (API Error)"
-
+        print(f"Gemini piece API Error: {e}"); traceback.print_exc()
+        return "My thoughts are clouded... (API Error)"
 
 # --- API Endpoints ---
 @app.route('/api/game', methods=['GET'])
 def get_game_state():
+    # ...(keep existing code)...
     global board, game_history_san
-    winner = None
-    termination = None
-    is_game_over = board.is_game_over(claim_draw=True)
+    winner, termination = None, None; is_game_over = board.is_game_over(claim_draw=True)
     if is_game_over:
-        outcome = board.outcome(claim_draw=True)
-        if outcome:
-            winner = "white" if outcome.winner == chess.WHITE else "black" if outcome.winner == chess.BLACK else "draw"
-            termination = outcome.termination.name.capitalize().replace('_', ' ')
+        outcome = board.outcome(claim_draw=True);
+        if outcome: winner = "white" if outcome.winner == chess.WHITE else "black" if outcome.winner == chess.BLACK else "draw"; termination = outcome.termination.name.capitalize().replace('_', ' ')
     if not game_history_san and board.move_stack:
-         print("Detected empty SAN history but non-empty move stack, resetting board state for /api/game.")
-         board = chess.Board()
-    return jsonify({
-        'fen': board.fen(), 'turn': 'white' if board.turn == chess.WHITE else 'black',
-        'is_game_over': is_game_over, 'winner': winner, 'termination': termination,
-        'history': game_history_san
-    })
+       print("Warning: Game history empty but move stack exists. Resetting board state.")
+       board = chess.Board()
+    return jsonify({'fen': board.fen(), 'turn': 'white' if board.turn == chess.WHITE else 'black', 'is_game_over': is_game_over, 'winner': winner, 'termination': termination, 'history': game_history_san})
 
-# --- MODIFIED make_move Endpoint ---
+
 @app.route('/api/move', methods=['POST'])
 def make_move():
+    # ...(keep existing code)...
     global board, game_history_san
     if board.turn != chess.WHITE: return jsonify({'error': 'Not White\'s turn'}), 400
-    if board.is_game_over(claim_draw=True): return jsonify({'error': 'Game is already over'}), 400
-
-    data = request.get_json()
-    uci_move_str = data.get('move')
-    if not uci_move_str or not (4 <= len(uci_move_str) <= 5):
-        return jsonify({'error': f'Invalid or missing UCI move: {uci_move_str}'}), 400
-
-    opponent_san_response = None # Will hold Lichess or Gemini move SAN
-    move_source = None # Track 'Lichess', 'Gemini', 'Random'
-
+    if board.is_game_over(claim_draw=True): return jsonify({'error': 'Game over'}), 400
+    data = request.get_json(); uci_move_str = data.get('move')
+    if not uci_move_str or not (4 <= len(uci_move_str) <= 5): return jsonify({'error': f'Invalid UCI: {uci_move_str}'}), 400
+    opponent_san_response, move_source = None, None
     try:
         move = board.parse_uci(uci_move_str)
         if move in board.legal_moves:
-            san_move = board.san(move)
-            board.push(move) # Push player move
-            game_history_san.append(san_move)
-            print(f"User (White) played: {uci_move_str} ({san_move})")
-            print(f"  Ply Count: {len(game_history_san)}") # Log ply count
-            print(f"  New FEN: {board.fen()}")
-
+            san_move = board.san(move); board.push(move); game_history_san.append(san_move)
+            print(f"User (W): {uci_move_str} ({san_move}) | Ply: {len(game_history_san)}")
             if not board.is_game_over(claim_draw=True):
-                # --- Decide Black's Move Source ---
                 if len(game_history_san) < OPENING_MOVE_LIMIT:
-                    print(f"Attempting Lichess move (Ply < {OPENING_MOVE_LIMIT})...")
                     opponent_san = get_lichess_opening_move(board)
-                    if opponent_san:
-                        opponent_san_response = opponent_san
-                        move_source = "Lichess"
-                    else:
-                        # Fallback to Gemini if Lichess fails
-                        print("Lichess failed or returned no move, falling back to Gemini...")
-                        opponent_san_response = get_llm_move(board, game_history_san)
-                        move_source = "Gemini (Lichess Fallback)"
-                else:
-                    # Use Gemini after opening limit
-                    print(f"Attempting Gemini move (Ply >= {OPENING_MOVE_LIMIT})...")
-                    opponent_san_response = get_llm_move(board, game_history_san)
-                    move_source = "Gemini"
+                    if opponent_san: opponent_san_response, move_source = opponent_san, "Lichess"
+                    else: print("Lichess fail->Gemini"); opponent_san_response, move_source = get_llm_move(board, game_history_san), "Gemini(Fallback)"
+                else: opponent_san_response, move_source = get_llm_move(board, game_history_san), "Gemini"
 
-                # If still no move (e.g., Gemini also failed), try random as last resort
                 if not opponent_san_response:
-                     print(f"{move_source or 'Move generation'} failed, trying random move...")
-                     legal_moves = [board.san(m) for m in board.legal_moves]
-                     if legal_moves:
-                         opponent_san_response = random.choice(legal_moves)
-                         move_source = "Random (Fallback)"
-                     else:
-                          print("No legal moves available for Black?") # Should be caught by game over check
+                    print(f"{move_source or 'MoveGen'} failed or returned nothing. Attempting random.")
+                    legal_moves = [board.san(m) for m in board.legal_moves];
+                    if legal_moves: opponent_san_response, move_source = random.choice(legal_moves), "Random(Fallback)"
+                    else: print("Error: No legal moves for opponent?"); opponent_san_response = None
 
-                # --- Push Opponent's Move (if found) ---
                 if opponent_san_response:
                     try:
-                        llm_move = board.parse_san(opponent_san_response)
-                        if llm_move in board.legal_moves:
-                             board.push(llm_move) # Push opponent move
-                             game_history_san.append(opponent_san_response)
-                             print(f"Opponent ({move_source}) played: {opponent_san_response}")
-                             print(f"  Ply Count: {len(game_history_san)}")
-                             print(f"  New FEN: {board.fen()}")
-                        else:
-                             print(f"CRITICAL BACKEND ERROR: {move_source} move {opponent_san_response} validated but illegal?")
-                    except ValueError as e_parse_opp:
-                         print(f"CRITICAL BACKEND ERROR: {move_source} move {opponent_san_response} failed SAN parsing? Error: {e_parse_opp}")
-                         traceback.print_exc()
-                    except Exception as e_push_opp:
-                         print(f"Error processing {move_source} move {opponent_san_response}: {e_push_opp}")
-                         traceback.print_exc()
+                        opp_move = board.parse_san(opponent_san_response);
+                        if opp_move in board.legal_moves: board.push(opp_move); game_history_san.append(opponent_san_response); print(f"Opponent ({move_source}): {opponent_san_response}")
+                        else: print(f"ERROR: {move_source} proposed illegal move {opponent_san_response}. Board state: {board.fen()}")
+                    except ValueError as e: print(f"ERROR: Parsing {move_source} SAN '{opponent_san_response}': {e}")
+                    except Exception as e: print(f"ERROR: Pushing {move_source} move '{opponent_san_response}': {e}")
+                else: print(f"Opponent ({move_source or 'System'}) could not generate a move.")
 
-            # --- Return final state ---
-            final_state_data = get_game_state().get_json()
-            # Add source info if needed, but response SAN is already opponent_san_response
-            final_state_data['last_llm_move'] = opponent_san_response # Keep key name for frontend consistency
+            final_state_data = get_game_state().get_json();
+            final_state_data['last_llm_move'] = opponent_san_response
             return jsonify(final_state_data)
-
-        else: # User move was illegal
-             try: illegal_san = board.san(move)
-             except: illegal_san = uci_move_str
-             print(f"Illegal user move attempt: {uci_move_str} ({illegal_san})")
-             return jsonify({'error': f'Illegal move: {illegal_san} ({uci_move_str})'}), 400
-
-    except ValueError as e_parse_user: # Catches user's bad UCI
-        print(f"Invalid user move notation: {uci_move_str} - Error: {e_parse_user}")
-        return jsonify({'error': f'Invalid or illegal move notation: {uci_move_str}'}), 400
-    except Exception as e:
-        print(f"Unexpected error during move processing: {e}")
-        traceback.print_exc()
-        return jsonify({'error': 'An internal server error occurred during move processing'}), 500
+        else:
+            try: illegal_san = board.san(move)
+            except: illegal_san = uci_move_str;
+            return jsonify({'error': f'Illegal move: {illegal_san}'}), 400
+    except ValueError: return jsonify({'error': f'Invalid move notation: {uci_move_str}'}), 400
+    except Exception as e: print(f"Error during move processing: {e}"); traceback.print_exc(); return jsonify({'error': 'Server error during move processing'}), 500
 
 
 @app.route('/api/reset', methods=['POST'])
 def reset_game():
-    global board, game_history_san
-    board = chess.Board()
-    game_history_san = []
-    print("Game reset.")
-    state_data = get_game_state().get_json()
-    return jsonify(state_data)
+    # ...(keep existing code)...
+    global board, game_history_san; board = chess.Board(); game_history_san = []; print("Game Reset."); return jsonify(get_game_state().get_json())
 
 
 @app.route('/api/ask_piece', methods=['POST'])
 def ask_piece():
-    global game_history_san
-    if not genai_model: return jsonify({'error': 'LLM not configured.'}), 503
-    data = request.get_json()
+    # ...(keep existing code)...
+    global game_history_san;
+    if not genai_model: return jsonify({'error': 'LLM is not available.'}), 503
+    data = request.get_json();
     question, piece_code, square, fen = data.get('question'), data.get('piece'), data.get('square'), data.get('fen')
-    current_history = game_history_san
-    if not all([question, piece_code, square, fen]): return jsonify({'error': 'Missing required data'}), 400
-    if not (piece_code.startswith('w') and len(piece_code) == 2 and piece_code[1] in 'PNBRQK'): return jsonify({'error': f'Invalid piece code: {piece_code}.'}), 400
-    try: chess.parse_square(square); chess.Board(fen)
-    except ValueError: return jsonify({'error': f'Invalid square or FEN'}), 400
+    if not all([question, piece_code, square, fen]): return jsonify({'error': 'Missing required data (question, piece, square, fen)'}), 400
+    if not (piece_code.startswith('w') and len(piece_code)==2 and piece_code[1] in 'PNBRQK'): return jsonify({'error': 'Invalid piece code format.'}), 400
     try:
-        answer = get_llm_piece_perspective(fen, current_history, piece_code, square, question)
+        chess.parse_square(square)
+        temp_board = chess.Board(fen)
+        piece_at_sq = temp_board.piece_at(chess.parse_square(square))
+        expected_symbol = piece_code[1].upper() if piece_code.startswith('w') else piece_code[1].lower()
+        if not piece_at_sq or piece_at_sq.symbol() != expected_symbol:
+            print(f"Warning: Piece mismatch. FEN shows {piece_at_sq} at {square}, user asked about {piece_code}")
+    except ValueError as e: return jsonify({'error': f'Invalid square or FEN provided: {e}'}), 400
+    except Exception as e: return jsonify({'error': f'Error validating input: {e}'}), 400
+
+    try:
+        answer = get_llm_piece_perspective(fen, game_history_san, piece_code, square, question)
         return jsonify({'answer': answer})
     except Exception as e:
-        print(f"Error in /api/ask_piece route: {e}"); traceback.print_exc()
-        return jsonify({'error': 'Internal server error asking piece.'}), 500
+        print(f"Error getting piece perspective: {e}"); traceback.print_exc();
+        return jsonify({'error': 'Server error while asking piece'}), 500
 
 
-# --- Frontend Serving Route (No changes needed here) ---
+# --- Frontend Serving Route ---
 @app.route('/')
 def index():
-    # HTML content remains the same as in the previous successful version
+    # Correctly indented Python block starts here
     html_content = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Chess vs Gemini/Lichess (Talk to Pieces)</title> <!-- Updated Title -->
-
-    <!-- Chessboard.js CSS -->
-    <link rel="stylesheet"
-          href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css"
-          crossorigin="anonymous">
-
-    <!-- Include jQuery -->
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"
-            integrity="sha256-/xUj+3OJU5yExlq6GSYGSHk7tPXikynS7ogEvDej/m4="
-            crossorigin="anonymous"></script>
-
-    <!-- Chessboard.js JS -->
-    <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"
-            crossorigin="anonymous"></script>
-
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ChessTalk</title>
+    <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css" crossorigin="anonymous">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js" integrity="sha256-/xUj+3OJU5yExlq6GSYGSHk7tPXikynS7ogEvDej/m4=" crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js" crossorigin="anonymous"></script>
     <style>
-        body { font-family: sans-serif; display: flex; justify-content: center; padding: 20px; background-color: #f0f0f0; }
-        .container { display: flex; flex-direction: column; align-items: center; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 500px; /* Limit width */}
-        #myBoard { width: 90vw; max-width: 450px; /* Responsive board */ margin-bottom: 15px; }
-        .status-info { font-size: 1.1em; font-weight: bold; margin-bottom: 10px; padding: 8px 15px; border-radius: 4px; text-align: center; min-width: 250px; }
+        body { font-family: sans-serif; display: flex; justify-content: center; padding: 10px; background-color: #f0f0f0; margin: 0; -webkit-tap-highlight-color: transparent; }
+        .container { display: flex; flex-direction: column; align-items: center; background-color: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 100%; max-width: 500px; box-sizing: border-box; }
+        #myBoard { width: 90vw; max-width: 450px; margin-bottom: 15px; user-select: none; -webkit-user-select: none; touch-action: none; }
+        h1 { margin-top: 0; margin-bottom: 5px; color: #333; font-size: 1.8em; text-align: center; }
+        .subheaders { text-align: center; color: #555; margin-bottom: 10px; font-size: 1.1em; line-height: 1.4; }
+        #instructions { font-size: 0.9em; color: #666; margin-bottom: 15px; text-align: center; background-color: #f9f9f9; padding: 8px; border-radius: 4px; border: 1px solid #eee;}
+        .status-info { font-size: 1.1em; font-weight: bold; margin-bottom: 10px; padding: 8px 15px; border-radius: 4px; text-align: center; min-width: 200px; width: 90%; box-sizing: border-box; }
         .status-info.turn-white { background-color: #e0ffe0; border: 1px solid #90ee90; color: #006400; }
         .status-info.turn-black { background-color: #f0f0f0; border: 1px solid #cccccc; color: #333; }
         .status-info.thinking { background-color: #fffacd; border: 1px solid #ffd700; color: #b8860b; animation: pulse 1.5s infinite ease-in-out; }
@@ -491,40 +363,37 @@ def index():
         .controls { margin-bottom: 15px; }
         .button { padding: 10px 15px; font-size: 1em; border: none; border-radius: 4px; cursor: pointer; margin: 0 5px; transition: background-color 0.2s; }
         .button:disabled { background-color: #ccc; cursor: not-allowed; }
-        .button-primary { background-color: #4CAF50; color: white; }
-        .button-primary:hover:not(:disabled) { background-color: #45a049; }
-        .button-secondary { background-color: #008CBA; color: white; }
-        .button-secondary:hover:not(:disabled) { background-color: #007ba7; }
-        .history-log { max-height: 150px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; width: 90%; margin-top: 10px; background-color: #f9f9f9; border-radius: 4px; }
+        .button-primary { background-color: #4CAF50; color: white; } .button-primary:hover:not(:disabled) { background-color: #45a049; }
+        .button-secondary { background-color: #008CBA; color: white; } .button-secondary:hover:not(:disabled) { background-color: #007ba7; }
+        .history-log { max-height: 120px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; width: 90%; margin-top: 10px; background-color: #f9f9f9; border-radius: 4px; box-sizing: border-box; }
         .history-log h2 { margin: 0 0 10px 0; font-size: 1.1em; text-align: center; border-bottom: 1px solid #eee; padding-bottom: 5px; color: #555; }
         #history-list { list-style: none; padding: 0; margin: 0; font-size: 0.9em; }
-        #history-list li { padding: 3px 0; border-bottom: 1px dotted #eee; display: flex; justify-content: space-between; }
-        #history-list li:last-child { border-bottom: none; }
+        #history-list li { padding: 3px 0; border-bottom: 1px dotted #eee; display: flex; justify-content: space-between; } #history-list li:last-child { border-bottom: none; }
         #history-list .move-number { color: #888; font-weight: bold; flex-basis: 10%; text-align: right; padding-right: 5px;}
         #history-list .move-white { flex-basis: 45%; text-align: center; font-weight: 500;}
         #history-list .move-black { flex-basis: 45%; text-align: left; font-weight: normal;}
-
-
-        /* --- Dialog Box Styles --- */
         .dialog-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.6); display: none; justify-content: center; align-items: center; z-index: 1000; }
-        .dialog-box { background-color: white; padding: 25px; border-radius: 8px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); text-align: center; max-width: 400px; width: 90%; position: relative; }
+        .dialog-box { background-color: white; padding: 25px; border-radius: 8px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); text-align: center; max-width: 400px; width: 90%; position: relative; box-sizing: border-box; }
         .dialog-box h3 { margin-top: 0; margin-bottom: 15px; font-size: 1.2em; color: #333; }
-        .dialog-box textarea { width: 95%; min-height: 60px; margin-bottom: 15px; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 1em; resize: vertical; }
+        .dialog-box textarea { width: 95%; min-height: 60px; margin-bottom: 15px; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 1em; resize: vertical; box-sizing: border-box; }
         .dialog-box .dialog-buttons { display: flex; justify-content: space-around; }
         .dialog-response { margin-top: 15px; padding: 10px; background-color: #eef; border: 1px solid #ccd; border-radius: 4px; text-align: left; font-style: italic; max-height: 150px; overflow-y: auto; min-height: 40px; }
         .dialog-response.thinking { color: #888; display: flex; align-items: center; justify-content: center;}
         .dialog-response.error { color: #dc143c; font-weight: bold; }
         .dialog-close-btn { position: absolute; top: 10px; right: 10px; background: none; border: none; font-size: 1.5em; cursor: pointer; color: #888; line-height: 1; padding: 0;}
         .dialog-close-btn:hover { color: #333; }
-
-        /* Animation for thinking status */
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+        @media (max-width: 480px) { h1 { font-size: 1.6em; } .subheaders { font-size: 1em; } #myBoard { max-width: 320px; } .button { padding: 8px 12px; font-size: 0.9em; } .status-info { font-size: 1em; } }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Chess vs Gemini/Lichess</h1> <!-- Updated Title -->
-        <p>You play White. Opponent uses Lichess openings (first 5 moves), then Gemini. Right-click your pieces to talk to them!</p> <!-- Updated Description -->
+        <h1>ChessTalk</h1>
+        <div class="subheaders">
+            Play Chess against Gemini<br>
+            Talk to Your Pieces (White)
+        </div>
+        <div id="instructions">Loading instructions...</div>
         <div id="myBoard"></div>
         <div id="status" class="status-info">Loading game...</div>
         <div class="controls">
@@ -537,7 +406,7 @@ def index():
     </div>
 
     <!-- Dialog Box HTML -->
-    <div id="piece-dialog-overlay" class="dialog-overlay">
+     <div id="piece-dialog-overlay" class="dialog-overlay">
         <div class="dialog-box">
             <button id="dialog-close" class="dialog-close-btn" aria-label="Close dialog">×</button>
             <h3 id="dialog-title">Ask the Piece</h3>
@@ -548,320 +417,280 @@ def index():
                 <button id="dialog-cancel" class="button button-secondary">Cancel</button>
             </div>
         </div>
-    </div>
+     </div>
 
-       <script>
-        // Frontend Javascript remains the same as the previous working version.
-        // No changes are needed here as the logic swap (Lichess vs Gemini)
-        // happens entirely on the backend within the /api/move endpoint.
-        // The frontend just sends the move and receives the updated game state.
+    <!-- *** START OF JAVASCRIPT (inside the Python string) *** -->
+    <script>
         $(document).ready(function() {
             console.log("JS: Document ready.");
+            // --- 1. Variables ---
+            var board = null, currentFen = 'start', currentGameHistory = [];
+            var isPlayerTurn = true, isGameOver = false, isProcessingMove = false;
+            var $status = $('#status'), $historyList = $('#history-list'), $boardElement = $('#myBoard');
+            var $dialogOverlay = $('#piece-dialog-overlay'), $dialogTitle = $('#dialog-title'), $dialogQuestion = $('#dialog-question'), $dialogResponseArea = $('#dialog-response-area'), $dialogSubmit = $('#dialog-submit'), $dialogCancel = $('#dialog-cancel'), $dialogClose = $('#dialog-close');
+            var currentDialogData = null;
 
-            // 1. Variable Declarations
-            var board = null; // Chessboard.js instance
-            var currentFen = 'start';
-            var currentGameHistory = []; // Stores SAN moves received from backend
-            var isPlayerTurn = true;
-            var isGameOver = false;
-            var isProcessingMove = false; // Flag to prevent interaction during processing
-            var $status = $('#status');
-            var $historyList = $('#history-list');
-            var $boardElement = $('#myBoard'); // The div Chessboard is attached to
-            var $dialogOverlay = $('#piece-dialog-overlay');
-            var $dialogTitle = $('#dialog-title');
-            var $dialogQuestion = $('#dialog-question');
-            var $dialogResponseArea = $('#dialog-response-area');
-            var $dialogSubmit = $('#dialog-submit');
-            var $dialogCancel = $('#dialog-cancel');
-            var $dialogClose = $('#dialog-close');
-            var currentDialogData = null; // Stores {piece, square} for the open dialog
-            var isRightMouseButtonDown = false; // Flag for right mouse button detection
+            // --- Interaction State ---
+            const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || ('ontouchstart' in window);
+            var isRightMouseButtonDown = false; // Desktop right-click flag
+
+            // Long Press (Mobile Dialog)
+            var longPressTimer = null;
+            var longPressDuration = 700; // milliseconds
+            var touchstartX = 0, touchstartY = 0;
+            var pressTargetSquare = null, pressTargetPiece = null;
+            var longPressFired = false; // Flag to prevent drag immediately after long press dialog
 
             const API_BASE_URL = "/api";
+            console.log("JS: Mobile detected:", isMobile);
 
-            // 2. Helper Function Definitions
+            // --- Update Instructions ---
+            const $instructions = $('#instructions');
+             if (isMobile) {
+                $instructions.html("You play White. Swipe/Drag pieces to move.<br><b>Long-press</b> your pieces to talk!");
+             } else {
+                $instructions.html("You play White. Drag pieces to move.<br><b>Right-click</b> your pieces to talk!");
+             }
+
+            // --- 2. Helpers ---
             async function fetchApi(endpoint, method = 'GET', body = null) {
                 const url = `${API_BASE_URL}${endpoint}`;
-                const options = {
-                    method: method,
-                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }
-                };
+                const options = { method: method, headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }};
                 if (body) { options.body = JSON.stringify(body); }
-                console.log(`JS: Fetching ${method} ${url}`, body ? JSON.stringify(body) : '');
+                console.log(`JS: Fetch ${method} ${url}`, body ? JSON.stringify(body).substring(0,100) : '');
                 try {
-                    const response = await fetch(url, options);
-                    const responseData = await response.json(); // Assume JSON response
-                    console.log(`JS: Fetch response for ${method} ${url} - Status: ${response.status}`, responseData);
-                    if (!response.ok) {
-                         const errorMessage = responseData.error || `HTTP error! Status: ${response.status}`;
-                         console.error(`API Error Response (${method} ${url}):`, responseData);
-                         throw new Error(errorMessage);
-                    }
-                    return responseData;
-                } catch (error) {
-                    console.error(`API Error Caught (${method} ${url}):`, error);
-                    updateStatus(`Error: ${error.message || 'Network or server error'}`, true);
-                    throw error; // Re-throw
+                    const r = await fetch(url, options);
+                    const d = await r.json();
+                    if (!r.ok) { throw new Error(d.error || `HTTP ${r.status}`); }
+                    return d;
+                } catch (e) {
+                    console.error(`API Error (${method} ${url}):`, e);
+                    updateStatus(`Error: ${e.message || 'Network'}`, true);
+                    throw e;
                 }
             }
-
-            function updateStatus(message, isError = false, isThinking = false, baseClass = null) {
-                if(!$status.length) { console.error("JS: Status element #status not found!"); return; }
-                console.log(`JS: updateStatus - Message: "${message}", Error: ${isError}, Thinking: ${isThinking}, BaseClass: ${baseClass}`);
-                $status.text(message);
-                $status.removeClass('error thinking turn-white turn-black game-over'); // Clear previous states
-                if(baseClass) $status.addClass(baseClass);
-                if(isError) $status.addClass('error');
-                if(isThinking) $status.addClass('thinking');
+            function updateStatus(msg, isErr=false, isThink=false, baseCls=null) {
+                if(!$status.length) return;
+                $status.text(msg);
+                $status.removeClass('error thinking turn-white turn-black game-over');
+                if(baseCls) $status.addClass(baseCls);
+                if(isErr) $status.addClass('error');
+                if(isThink) $status.addClass('thinking');
             }
-
-             function updateHistoryList(history) {
-                 if(!$historyList.length) { console.warn("JS: History list element #history-list not found."); return; }
-                 $historyList.empty();
-                 currentGameHistory = Array.isArray(history) ? history : [];
-                 console.log("JS: Updating history list with:", currentGameHistory);
-
-                 if (currentGameHistory.length === 0) {
-                     $historyList.append('<li>No moves yet.</li>'); return;
-                 }
-
-                 for (let i = 0; i < currentGameHistory.length; i += 2) {
-                     const moveNumber = Math.floor(i / 2) + 1;
-                     const whiteMove = currentGameHistory[i] || '';
-                     const blackMove = currentGameHistory[i + 1] || (isGameOver ? '' : '...');
-
-                     const listItem = `<li>
-                         <span class="move-number">${moveNumber}.</span>
-                         <span class="move-white">${whiteMove}</span>
-                         <span class="move-black">${blackMove}</span>
-                     </li>`;
-                     $historyList.append(listItem);
-                 }
-                 const historyLogElement = $historyList.closest('.history-log')[0];
-                 if (historyLogElement) { historyLogElement.scrollTop = historyLogElement.scrollHeight; }
-            }
-
-
-             function getPieceName(pieceCode) {
-                const map = { 'P': 'Pawn', 'N': 'Knight', 'B': 'Bishop', 'R': 'Rook', 'Q': 'Queen', 'K': 'King' };
-                if (typeof pieceCode === 'string' && pieceCode.length === 2) {
-                    return map[pieceCode[1].toUpperCase()] || 'Unknown Piece';
+            function updateHistoryList(hist) {
+                if(!$historyList.length) return;
+                $historyList.empty();
+                currentGameHistory = Array.isArray(hist) ? hist : [];
+                if (currentGameHistory.length === 0) { $historyList.append('<li>No moves yet.</li>'); return; }
+                for (let i=0; i<currentGameHistory.length; i+=2) {
+                    const mn=Math.floor(i/2)+1;
+                    const wm=currentGameHistory[i]||'';
+                    const bm=currentGameHistory[i+1]||(isGameOver?'':'...');
+                    $historyList.append(`<li><span class="move-number">${mn}.</span><span class="move-white">${wm}</span><span class="move-black">${bm}</span></li>`);
                 }
-                return 'Unknown Piece';
+                const logEl=$historyList.closest('.history-log')[0];
+                if(logEl) logEl.scrollTop=logEl.scrollHeight;
+            }
+            function getPieceName(pc) {
+                const map={'P':'Pawn','N':'Knight','B':'Bishop','R':'Rook','Q':'Queen','K':'King'};
+                return (typeof pc === 'string' && pc.length === 2) ? map[pc[1].toUpperCase()]||'?' : '?';
             }
 
-
-            // 3. State Update Function (No changes needed from previous version)
+             // --- 3. State Update ---
             function updateGameState(data) {
-                console.log("JS: updateGameState called with data:", data);
-                if (data && typeof data.fen === 'string') {
-                    console.log("JS: updateGameState - Data is valid, processing state.");
-                    const wasLoading = $status.text() === "Loading game...";
-
+                 console.log("JS: updateGameState called");
+                 if (data && typeof data.fen === 'string') {
+                    const wasLoading = $status.text().startsWith("Loading");
                     currentFen = data.fen;
                     currentGameHistory = Array.isArray(data.history) ? data.history : [];
                     isGameOver = data.is_game_over || false;
                     isPlayerTurn = (data.turn === 'white') && !isGameOver;
 
-                    let statusMsg = "Status Error"; let statusClass = "error";
+                    let statusMsg = "Error"; let statusClass = "error";
                     if (isGameOver) {
                         statusClass = "game-over";
-                        const terminationReason = data.termination ? `(${data.termination})` : '';
-                        if (data.winner === 'white') statusMsg = `🎉 Game Over! You Won! ${terminationReason}`;
-                        else if (data.winner === 'black') statusMsg = `🤖 Game Over! Opponent Won! ${terminationReason}`; // Changed LLM to Opponent
-                        else statusMsg = `🤝 Game Over! Draw! ${terminationReason}`;
+                        const term = data.termination ? `(${data.termination})` : '';
+                        if (data.winner === 'white') statusMsg = `🎉 Game Over! You Won! ${term}`;
+                        else if (data.winner === 'black') statusMsg = `🤖 Game Over! Opponent Won! ${term}`;
+                        else statusMsg = `🤝 Game Over! Draw! ${term}`;
                     } else if (isPlayerTurn) {
                         statusClass = "turn-white"; statusMsg = "⚪ Your Turn (White)";
                     } else {
-                        statusClass = "turn-black"; statusMsg = "⚫ Opponent is thinking..."; // Changed LLM to Opponent
-                        if (!wasLoading) { updateStatus(statusMsg, false, true, statusClass); }
+                        statusClass = "turn-black"; statusMsg = "⚫ Opponent is thinking...";
+                        if (!wasLoading && $status.text() !== "🔄 Resetting game...") {
+                            updateStatus(statusMsg, false, true, statusClass);
+                        } else { updateStatus(statusMsg, false, false, statusClass); }
                     }
-                    console.log(`JS: updateGameState - Status determined: "${statusMsg}", Class: ${statusClass}`);
 
-                    const finalStatusMsg = statusMsg;
-                    const finalStatusClass = statusClass;
-                    const isThinkingStatus = (finalStatusClass === 'turn-black' && !isGameOver && !wasLoading);
-
-                    const updateFunc = () => { updateStatus(finalStatusMsg, false, isThinkingStatus, finalStatusClass); };
-
-                    if (wasLoading) { setTimeout(updateFunc, 150); }
-                    else { updateFunc(); }
+                    if (statusClass !== "turn-black" || wasLoading || $status.text() === "🔄 Resetting game...") {
+                         const finalStatusMsg = statusMsg; const finalStatusClass = statusClass;
+                         const isThinkingStatus = false;
+                         const updateFunc = () => { updateStatus(finalStatusMsg, false, isThinkingStatus, finalStatusClass); };
+                         if (wasLoading) { setTimeout(updateFunc, 150); } else { updateFunc(); }
+                    }
 
                     updateHistoryList(currentGameHistory);
 
                     if (board && typeof board.position === 'function') {
-                        board.position(currentFen, false);
+                        if(board.fen() !== currentFen) { board.position(currentFen, false); }
                     } else { console.error("JS: updateGameState - CRITICAL: Board object invalid!"); }
 
-                    if(data.last_llm_move) { // Check if opponent moved
-                         console.log(`JS: updateGameState detected opponent move: ${data.last_llm_move}`);
-                         if (!isGameOver) { updateStatus("⚪ Your Turn (White)", false, false, "turn-white"); }
-                    } else if (!isPlayerTurn && !isGameOver && !isThinkingStatus) {
-                         updateStatus("⚫ Opponent's Turn (Black)", false, false, "turn-black"); // Changed LLM to Opponent
+                    if(data.last_llm_move && !isGameOver && statusClass !== "turn-white") {
+                         updateStatus("⚪ Your Turn (White)", false, false, "turn-white");
                     }
-
-                } else {
-                     console.error("JS: updateGameState received invalid data:", data);
+                 } else {
+                     console.error("JS: updateGameState received invalid data");
                      updateStatus("Error: Invalid game state from server.", true);
                      isPlayerTurn = false; isGameOver = true;
-                }
-                console.log("JS: updateGameState finished.");
+                 }
+             }
+
+            // --- 4. Event Handlers ---
+            function clearLongPress() {
+                 if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+                 pressTargetSquare = null; pressTargetPiece = null;
             }
 
-
-            // 4. Event Handler Definitions (No changes needed from previous version)
-            function onBoardMouseDown(event) {
-                if (event.button === 2) {
-                    isRightMouseButtonDown = true; event.preventDefault();
-                } else if (event.button === 0 || event.button === 1) {
-                    isRightMouseButtonDown = false;
-                }
+            function onBoardMouseDown(event) { // Desktop only
+                if (event.button === 2) { isRightMouseButtonDown = true; }
+                else { isRightMouseButtonDown = false; }
+                 longPressFired = false; // Reset flag
             }
-            $boardElement.on('contextmenu', (e) => e.preventDefault());
+
+            $boardElement.on('contextmenu', (e) => { e.preventDefault(); return false; });
 
             function onDragStart (source, piece, position, orientation) {
-                if (isRightMouseButtonDown) {
-                    if (piece.search(/^w/) === -1) { isRightMouseButtonDown = false; return false; }
-                    return true; // Allow right-drag start on white pieces
-                }
-                // Prevent left-drag if invalid state
-                if (isGameOver || !isPlayerTurn || piece.search(/^b/) !== -1 || isProcessingMove) {
-                    return false;
-                }
-                return true; // Allow left-drag
+                console.log(`JS: onDragStart - Src:${source}, P:${piece}, Mobile:${isMobile}, LongPress:${longPressFired}, RClick:${isRightMouseButtonDown}`);
+                if (longPressFired) { console.log("JS: Drag prevented post-longpress."); return false; }
+                if (!isMobile && isRightMouseButtonDown) { console.log("JS: Drag prevented RClick."); return false; }
+                clearLongPress(); isRightMouseButtonDown = false;
+                if (isGameOver || !isPlayerTurn || piece.search(/^b/) !== -1 || isProcessingMove) { return false; }
+                console.log(`JS: Drag allowed for ${piece} from ${source}`);
+                return true;
             }
 
             async function onDrop (source, target, piece, newPos, oldPos, orientation) {
-                const wasRightMouseDown = isRightMouseButtonDown;
-                isRightMouseButtonDown = false; // Reset flag
+                console.log(`JS: onDrop - Src:${source}, Tgt:${target}, P:${piece}, WasRClick:${isRightMouseButtonDown}, Mobile:${isMobile}`);
+                const wasRightClickAttempt = isRightMouseButtonDown;
+                isRightMouseButtonDown = false; longPressFired = false; clearLongPress();
 
-                if (wasRightMouseDown && source === target) { // Right Click Release
-                    if (!piece || piece.search(/^w/) === -1 || isProcessingMove) return;
-                    openPieceDialog(piece, source); return;
+                if (source === target && wasRightClickAttempt && !isMobile) {
+                    console.log("JS: Right-click release on same square.");
+                    const isWhite = piece && piece.search(/^w/) !== -1;
+                    if (isWhite && !isProcessingMove && isPlayerTurn && !isGameOver) {
+                        openPieceDialog(piece, source); return;
+                    } else { return 'snapback'; }
                 }
-                if (wasRightMouseDown && source !== target) return 'snapback'; // Right Drag
-                if (source === target) return 'snapback'; // Left Click (No Drag)
-                if (isGameOver || !isPlayerTurn || isProcessingMove) return 'snapback'; // Invalid state for move
-
-                // --- Actual Move (Left Drag Drop) ---
-                var moveUCI = source + target;
-                if (piece === 'wP' && target.charAt(1) === '8') { moveUCI += 'q'; }
-
-                isProcessingMove = true;
-                $('#reset-game').prop('disabled', true);
-                updateStatus("⚪ Sending your move...", false, true, "turn-white");
-
-                try {
-                    const data = await fetchApi('/move', 'POST', { move: moveUCI });
-                    updateGameState(data);
-                } catch (error) {
-                    if (board) board.position(currentFen, false); // Revert visual board
-                    return 'snapback'; // Return snapback on error
-                } finally {
-                     isProcessingMove = false;
-                     $('#reset-game').prop('disabled', isGameOver);
+                else if (source !== target && !wasRightClickAttempt) {
+                    console.log("JS: Processing move.");
+                    if (isGameOver || !isPlayerTurn || isProcessingMove) return 'snapback';
+                    var moveUCI = source + target;
+                    if (piece === 'wP' && target.charAt(1) === '8') { moveUCI += 'q'; }
+                    isProcessingMove = true; $('#reset-game').prop('disabled', true);
+                    updateStatus("⚪ Sending move...", false, true, "turn-white");
+                    try {
+                        const data = await fetchApi('/move', 'POST', { move: moveUCI });
+                        updateGameState(data);
+                    } catch (error) {
+                        if (board) board.position(currentFen, false); return 'snapback';
+                    } finally {
+                        isProcessingMove = false; $('#reset-game').prop('disabled', isGameOver);
+                    }
                 }
+                else { console.log("JS: Snapback condition."); return 'snapback'; }
             }
 
-
-            // 5. Dialog Logic Functions (No changes needed from previous version)
+            // --- 5. Dialog Logic ---
             function openPieceDialog(piece, square) {
-                if (!piece || !square) return;
-                currentDialogData = { piece, square };
-                $dialogTitle.text(`Ask the ${getPieceName(piece)} on ${square}`);
-                $dialogQuestion.val('');
-                $dialogResponseArea.hide().empty().removeClass('error thinking');
-                $dialogSubmit.prop('disabled', false);
-                $dialogCancel.prop('disabled', false);
-                $dialogOverlay.css('display', 'flex');
-                $dialogQuestion.focus();
+                 clearLongPress(); longPressFired = true; // Set flag when dialog opens via long press
+                 if (!piece || !square) return;
+                 if ($dialogOverlay.is(':visible') && currentDialogData?.piece === piece && currentDialogData?.square === square) return;
+                 console.log(`JS: Opening dialog for ${piece} on ${square}`);
+                 currentDialogData = { piece, square }; $dialogTitle.text(`Ask the ${getPieceName(piece)} on ${square}`);
+                 $dialogQuestion.val(''); $dialogResponseArea.hide().empty().removeClass('error thinking');
+                 $dialogSubmit.prop('disabled', false); $dialogCancel.prop('disabled', false);
+                 $dialogOverlay.css('display', 'flex'); $dialogQuestion.focus();
             }
-            function closePieceDialog() { $dialogOverlay.hide(); currentDialogData = null; }
-            async function submitPieceQuestion() {
-                if (!currentDialogData) return;
-                const question = $dialogQuestion.val().trim();
-                if (!question) {
-                     $dialogResponseArea.text('Please enter a question.').addClass('error').show();
-                     setTimeout(() => { if (!$dialogResponseArea.hasClass('thinking')) $dialogResponseArea.hide().removeClass('error'); }, 2000);
-                     return;
-                 }
-                const { piece, square } = currentDialogData;
-                $dialogResponseArea.html('<i>Thinking...</i>').addClass('thinking').removeClass('error').show();
-                $dialogSubmit.prop('disabled', true); $dialogCancel.prop('disabled', true);
-                try {
-                    const data = await fetchApi('/ask_piece', 'POST', { question, piece, square, fen: currentFen });
-                    $dialogResponseArea.text(data.answer || 'Received empty answer.').removeClass('thinking error');
-                } catch (error) {
-                     $dialogResponseArea.text(`Error: ${error.message || 'Could not get answer.'}`).addClass('error').removeClass('thinking');
-                } finally {
-                     $dialogSubmit.prop('disabled', false); $dialogCancel.prop('disabled', false);
-                }
-            }
+            function closePieceDialog() { $dialogOverlay.hide(); currentDialogData = null; longPressFired = false; /* Reset flag on close */ } // Reset flag
+            async function submitPieceQuestion() { /* ... keep existing ... */ if (!currentDialogData) return; const question = $dialogQuestion.val().trim(); if (!question) { $dialogResponseArea.text('Please enter a question.').addClass('error').show(); setTimeout(() => { if (!$dialogResponseArea.hasClass('thinking')) $dialogResponseArea.hide().removeClass('error'); }, 2500); return; } const { piece, square } = currentDialogData; $dialogResponseArea.html('<i>Thinking...</i>').addClass('thinking').removeClass('error').show(); $dialogSubmit.prop('disabled', true); $dialogCancel.prop('disabled', true); try { const data = await fetchApi('/ask_piece', 'POST', { question, piece, square, fen: currentFen }); $dialogResponseArea.text(data.answer || 'The piece offered no answer.').removeClass('thinking error'); } catch (error) { $dialogResponseArea.text(`Error: ${error.message || 'Could not get answer.'}`).addClass('error').removeClass('thinking'); } finally { $dialogSubmit.prop('disabled', false); $dialogCancel.prop('disabled', false); } }
 
-            // 6. Initialization Function (No changes needed from previous version)
-            async function initializeGame() {
-                updateStatus("Loading game...", false, true);
-                isProcessingMove = true; $('#reset-game').prop('disabled', true);
-                try {
-                    const data = await fetchApi('/game');
-                    if (!data || typeof data.fen !== 'string' || !Array.isArray(data.history)) { throw new Error("Invalid initial game data."); }
-                    currentFen = data.fen; currentGameHistory = data.history;
-                    var config = {
-                        draggable: true, position: currentFen, orientation: 'white',
-                        onDragStart: onDragStart, onDrop: onDrop,
-                        pieceTheme: '/static/{piece}.png',
-                        moveSpeed: 300, snapbackSpeed: 500, snapSpeed: 100
-                    };
-                    if (!$('#myBoard').length) { throw new Error("#myBoard element not found."); }
-                    board = Chessboard('myBoard', config);
-                    if (!board || typeof board.position !== 'function') { throw new Error("Chessboard init failed."); }
-                    $(window).resize(() => { if(board) board.resize(); }).trigger('resize');
-                    $boardElement.on('mousedown', onBoardMouseDown);
-                    updateGameState(data);
-                } catch (error) {
-                    updateStatus(`Initialization Failed: ${error.message || 'Unknown error'}`, true);
-                } finally {
-                    isProcessingMove = false; $('#reset-game').prop('disabled', isGameOver);
-                }
-            }
-
-            // 7. Event Listener Bindings (No changes needed from previous version)
-             $('#reset-game').on('click', async function() {
-                 if (isProcessingMove) return;
-                 isProcessingMove = true; $(this).prop('disabled', true);
-                 closePieceDialog(); updateStatus("🔄 Resetting game...", false, true);
+            // --- 6. Init ---
+             async function initializeGame() {
+                 updateStatus("Loading game...", false, true); isProcessingMove = true; $('#reset-game').prop('disabled', true);
                  try {
-                    const data = await fetchApi('/reset', 'POST');
-                    if (board) board.position('start', false);
+                    const data = await fetchApi('/game');
+                    if (!data||!data.fen||!data.history) throw new Error("Invalid initial game data received.");
+                    currentFen = data.fen; currentGameHistory = data.history;
+
+                    var cfg = { draggable: true, position: currentFen, orientation: 'white', onDragStart: onDragStart, onDrop: onDrop, pieceTheme: '/static/{piece}.png', moveSpeed: 200, snapbackSpeed: 400, snapSpeed: 50 };
+                    if (!$('#myBoard').length) throw new Error("Board element #myBoard not found.");
+                    board = Chessboard('myBoard', cfg);
+                    if (!board || typeof board.position !== 'function') throw new Error("Chessboard initialization failed.");
+
+                    // --- Attach Platform-Specific Listeners ---
+                    if (!isMobile) { $boardElement.on('mousedown', onBoardMouseDown); } // Desktop RClick detect
+                    $boardElement.off('contextmenu').on('contextmenu', (e) => { e.preventDefault(); return false; }); // All platforms context prevent
+
+                    if (isMobile) { // Mobile Long Press detect
+                        $boardElement.on('touchstart', '.square-55d63', function(e) {
+                             if (e.originalEvent.touches.length > 1 || isProcessingMove || isGameOver || !isPlayerTurn) return;
+                             clearLongPress(); longPressFired = false;
+                             const squareId = $(this).data('square'), pieceCode = board.position()[squareId] || null;
+                             pressTargetSquare = squareId; pressTargetPiece = pieceCode;
+                             if (pieceCode && pieceCode.startsWith('w')) {
+                                touchstartX = e.originalEvent.touches[0].pageX; touchstartY = e.originalEvent.touches[0].pageY;
+                                console.log(`JS: touchstart ${squareId}(${pieceCode}). Start timer.`);
+                                longPressTimer = setTimeout(() => {
+                                    if (pressTargetSquare && pressTargetPiece && pressTargetPiece.startsWith('w') && !isProcessingMove && isPlayerTurn && !isGameOver) {
+                                         openPieceDialog(pressTargetPiece, pressTargetSquare); // Sets longPressFired=true
+                                    }
+                                    longPressTimer = null; pressTargetSquare = null; pressTargetPiece = null;
+                                }, longPressDuration);
+                             }
+                        });
+                        $boardElement.on('touchend touchcancel', '.square-55d63', function(e) {
+                             clearLongPress(); longPressFired = false; // Reset flag fully on touchend/cancel
+                        });
+                         $boardElement.on('touchmove', function(e) {
+                             if (longPressTimer && e.originalEvent.touches.length === 1) {
+                                  const threshold = 10;
+                                  let currentX = e.originalEvent.touches[0].pageX, currentY = e.originalEvent.touches[0].pageY;
+                                  if (Math.abs(currentX - touchstartX) > threshold || Math.abs(currentY - touchstartY) > threshold) { clearLongPress(); }
+                             }
+                        });
+                    }
+                    $(window).resize(() => { if(board) board.resize(); }).trigger('resize');
                     updateGameState(data);
-                 } catch (error) { /* Status updated by fetchApi */ }
-                 finally { isProcessingMove = false; $(this).prop('disabled', false); }
-             });
-            $dialogSubmit.on('click', submitPieceQuestion);
-            $dialogCancel.on('click', closePieceDialog); $dialogClose.on('click', closePieceDialog);
+                 } catch (error) {
+                     console.error("Initialization failed:", error); updateStatus(`Initialization Failed: ${error.message || 'Unknown error'}`, true); isGameOver = true;
+                 } finally { isProcessingMove = false; $('#reset-game').prop('disabled', isGameOver); }
+             }
+
+            // --- 7. Listeners ---
+            $('#reset-game').on('click', async function() { if (isProcessingMove) return; clearLongPress(); longPressFired=false; isProcessingMove = true; $(this).prop('disabled', true); closePieceDialog(); updateStatus("🔄 Resetting game...", false, true); try { const data = await fetchApi('/reset', 'POST'); if (board) board.position('start', false); updateGameState(data); } catch (error) {} finally { isProcessingMove = false; $(this).prop('disabled', false); } });
+            $dialogSubmit.on('click', submitPieceQuestion); $dialogCancel.on('click', closePieceDialog); $dialogClose.on('click', closePieceDialog);
             $dialogQuestion.on('keypress', (e) => { if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); submitPieceQuestion(); }});
             $(document).on('keydown', (e) => { if (e.key === "Escape" && $dialogOverlay.is(':visible')) { closePieceDialog(); }});
 
-            // 8. Start Application
+            // --- 8. Start ---
             initializeGame();
-
-        }); // End of $(document).ready
+        });
        </script>
-
-</body>
-</html>
+    <!-- *** END OF JAVASCRIPT *** -->
+    </body>
+    </html>
     """
+    # Correctly indented Python return statement
     return Response(html_content, mimetype='text/html')
 
 # --- Main Execution ---
+# Correctly placed and single __main__ block
 if __name__ == '__main__':
     print("--- Starting Flask Server ---")
     print(f"API Key Loaded: {'Yes' if GEMINI_API_KEY else 'No'}")
     print(f"Gemini Model: {MODEL_NAME if genai_model else 'Not Initialized'}")
-    print(f"Opponent Moves: Lichess API for first {OPENING_MOVE_LIMIT} plies, then {MODEL_NAME}")
-    print("Features: Talk to White Pieces (Revised Prompt w/ Explanation)")
-    print("Access at: http://127.0.0.1:5000/")
+    print(f"Opponent Moves: Lichess API for first {OPENING_MOVE_LIMIT} plies, then {MODEL_NAME if genai_model else 'Random'}")
+    print("Features: Talk to Pieces (Right-Click Desktop / Long-Press Mobile), Drag/Swipe Moves")
+    print("Access at: http://127.0.0.1:5000/ (or your local network IP:5000 if using host 0.0.0.0)")
     print("-----------------------------")
-    # Ensure requests library is installed: pip install requests
-    app.run(host='127.0.0.1', port=5000, debug=True, use_reloader=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=True)
